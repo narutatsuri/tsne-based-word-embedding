@@ -8,7 +8,14 @@ import plotly.express as px
 import pandas as pd
 import random
 import sys
+from time import time
+from sklearn.utils import check_random_state
+from scipy import linalg
+from scipy.spatial.distance import pdist
+from scipy.spatial.distance import squareform
 
+
+MACHINE_EPSILON = np.finfo(np.double).eps
 
 def init_embeddings(dataset, parameters, init_method):
     """
@@ -156,6 +163,33 @@ def plot_points(embeddings, vocab, dimensions):
                 y = np.array(embeddings[word][1])
                 z = np.array(embeddings[word][2])
                 df = df.append(pd.DataFrame([[x, y, z]], columns=["x", "y", "z"]))
+        fig = px.scatter_3d(df, x="x", y="y", z="z")
+        fig.update_yaxes(scaleanchor = "x", scaleratio = 1)
+        fig.update_zaxes(scaleanchor = "x", scaleratio = 1)
+        fig.show()
+
+def plot_points(embeddings, dimensions):
+    """Plots learned embeddings in matplotlib. Only works for 2/3 dimensions.
+    INPUTS:     Vectors, Int indicating dimensions
+    RETURNS:    None"""
+    if dimensions == 2:
+        df = pd.DataFrame(columns=["x", "y"])
+        
+        for point in embeddings:
+            x = np.array(point[0])
+            y = np.array(point[1])
+            df = df.append(pd.DataFrame([[x, y]], columns=["x", "y"]))
+        fig = px.scatter(df, x="x", y="y")
+        fig.update_yaxes(scaleanchor = "x", scaleratio = 1)
+        fig.show()
+    else:
+        df = pd.DataFrame(columns=["x", "y", "z"])
+
+        for point in embeddings:
+            x = np.array(point[0])
+            y = np.array(point[1])
+            z = np.array(point[2])
+            df = df.append(pd.DataFrame([[x, y, z]], columns=["x", "y", "z"]))
         fig = px.scatter_3d(df, x="x", y="y", z="z")
         fig.update_yaxes(scaleanchor = "x", scaleratio = 1)
         fig.update_zaxes(scaleanchor = "x", scaleratio = 1)
@@ -371,3 +405,256 @@ class partitions:
                         embeddings[word_1] = v_i
                     
             return embeddings
+        
+    
+def _kl_divergence(
+    params,
+    P,
+    degrees_of_freedom,
+    n_samples,
+    n_components,
+    skip_num_points=0,
+    compute_error=True,
+):
+
+    X_embedded = params.reshape(n_samples, n_components)
+
+    # Q is a heavy-tailed distribution: Student's t-distribution
+    dist = pdist(X_embedded, "sqeuclidean")
+    dist /= degrees_of_freedom
+    dist += 1.0
+    dist **= (degrees_of_freedom + 1.0) / -2.0
+    
+    P = np.maximum(squareform(P) / sum_P, MACHINE_EPSILON)
+    Q = np.maximum(dist / (2.0 * np.sum(dist)), MACHINE_EPSILON)
+
+    # Optimization trick below: np.dot(x, y) is faster than
+    # np.sum(x * y) because it calls BLAS
+
+    # Objective: C (Kullback-Leibler divergence of P and Q)
+    if compute_error:
+        print(P.shape, Q.shape, n_samples, n_components)
+        kl_divergence = 2.0 * np.dot(P, np.log(np.maximum(P, MACHINE_EPSILON) / Q))
+    else:
+        kl_divergence = np.nan
+
+    # Gradient: dC/dY
+    # pdist always returns double precision distances. Thus we need to take
+    grad = np.ndarray((n_samples, n_components), dtype=params.dtype)
+    PQd = squareform((P - Q) * dist)
+    for i in range(skip_num_points, n_samples):
+        grad[i] = np.dot(np.ravel(PQd[i], order="K"), X_embedded[i] - X_embedded)
+    grad = grad.ravel()
+    c = 2.0 * (degrees_of_freedom + 1.0) / degrees_of_freedom
+    grad *= c
+
+    return kl_divergence, grad
+
+def _gradient_descent(
+    objective,
+    p0,
+    it,
+    n_iter,
+    args,
+    kwargs,
+    n_iter_check=1,
+    n_iter_without_progress=300,
+    momentum=0.8,
+    learning_rate=200.0,
+    min_gain=0.01,
+    min_grad_norm=1e-7,
+    verbose=0):
+
+    p = p0.copy().ravel()
+    update = np.zeros_like(p)
+    gains = np.ones_like(p)
+    error = np.finfo(float).max
+    best_error = np.finfo(float).max
+    best_iter = i = it
+
+    tic = time()
+    for i in range(it, n_iter):
+        check_convergence = (i + 1) % n_iter_check == 0
+        # only compute the error when needed
+        kwargs["compute_error"] = check_convergence or i == n_iter - 1
+
+        error, grad = objective(params=p0, 
+                                P=args[0], 
+                                degrees_of_freedom=args[1],
+                                n_samples=args[2],
+                                n_components=args[3])
+        
+        grad_norm = linalg.norm(grad)
+
+        inc = update * grad < 0.0
+        dec = np.invert(inc)
+        gains[inc] += 0.2
+        gains[dec] *= 0.8
+        np.clip(gains, min_gain, np.inf, out=gains)
+        grad *= gains
+        update = momentum * update - learning_rate * grad
+        p += update
+
+        if check_convergence:
+            toc = time()
+            duration = toc - tic
+            tic = toc
+
+            if verbose >= 2:
+                print(
+                    "[t-SNE] Iteration %d: error = %.7f,"
+                    " gradient norm = %.7f"
+                    " (%s iterations in %0.3fs)"
+                    % (i + 1, error, grad_norm, n_iter_check, duration)
+                )
+
+            if error < best_error:
+                best_error = error
+                best_iter = i
+            elif i - best_iter > n_iter_without_progress:
+                if verbose >= 2:
+                    print(
+                        "[t-SNE] Iteration %d: did not make any progress "
+                        "during the last %d episodes. Finished."
+                        % (i + 1, n_iter_without_progress)
+                    )
+                break
+            if grad_norm <= min_grad_norm:
+                if verbose >= 2:
+                    print(
+                        "[t-SNE] Iteration %d: gradient norm %f. Finished."
+                        % (i + 1, grad_norm)
+                    )
+                break
+
+    return p, error, i
+
+class modified_TSNE():
+    
+    # Control the number of exploration iterations with early_exaggeration on
+    _EXPLORATION_N_ITER = 250
+
+    # Control the number of iterations between progress checks
+    _N_ITER_CHECK = 50
+
+    def __init__(self,
+                 n_components=2,
+                 *,
+                 perplexity=30.0,
+                 early_exaggeration=12.0,
+                 learning_rate="warn",
+                 n_iter=1000,
+                 n_iter_without_progress=300,
+                 min_grad_norm=1e-7,
+                 verbose=0,
+                 random_state=None,
+                 method="barnes_hut",
+                 angle=0.5,
+                 n_jobs=None,
+                 square_distances="legacy"):
+        
+        self.n_components = n_components
+        self.perplexity = perplexity
+        self.early_exaggeration = early_exaggeration
+        self.learning_rate = learning_rate
+        self._learning_rate = 200.0
+        self.n_iter = n_iter
+        self.n_iter_without_progress = n_iter_without_progress
+        self.min_grad_norm = min_grad_norm
+        self.verbose = verbose
+        self.random_state = random_state
+        self.method = method
+        self.angle = angle
+        self.n_jobs = n_jobs
+        self.square_distances = square_distances
+
+    def _fit(self, distributions):
+        """Private function to fit the model using X as training data."""
+        
+        P = distributions
+        n_samples = distributions.shape[0]
+        random_state = check_random_state(self.random_state)
+        X_embedded = 1e-4 * random_state.randn(n_samples, self.n_components).astype(np.float32)
+
+        # Degrees of freedom of the Student's t-distribution. The suggestion
+        # degrees_of_freedom = n_components - 1 comes from
+        # "Learning a Parametric Embedding by Preserving Local Structure"
+        # Laurens van der Maaten, 2009.
+        degrees_of_freedom = max(self.n_components - 1, 1)
+
+        return self._tsne(P, degrees_of_freedom, n_samples, X_embedded)
+
+    def _tsne(self,
+              P,
+              degrees_of_freedom,
+              n_samples,
+              X_embedded,
+              skip_num_points=0):
+        
+        """Runs t-SNE."""
+        # t-SNE minimizes the Kullback-Leiber divergence of the Gaussians P
+        # and the Student's t-distributions Q. The optimization algorithm that
+        # we use is batch gradient descent with two stages:
+        # * initial optimization with early exaggeration and momentum at 0.5
+        # * final optimization with momentum at 0.8
+        params = X_embedded.ravel()
+
+        opt_args = {
+            "it": 0,
+            "n_iter_check": self._N_ITER_CHECK,
+            "min_grad_norm": self.min_grad_norm,
+            "learning_rate": self._learning_rate,
+            "verbose": self.verbose,
+            "kwargs": dict(skip_num_points=skip_num_points),
+            "args": [P, degrees_of_freedom, n_samples, self.n_components],
+            "n_iter_without_progress": self._EXPLORATION_N_ITER,
+            "n_iter": self._EXPLORATION_N_ITER,
+            "momentum": 0.5,
+        }
+
+        obj_func = _kl_divergence
+
+        # Learning schedule (part 1): do 250 iteration with lower momentum but
+        # higher learning rate controlled via the early exaggeration parameter
+        P *= self.early_exaggeration
+        params, kl_divergence, it = _gradient_descent(objective=obj_func, 
+                                                           p0=params, 
+                                                           it=0, 
+                                                           n_iter=self._EXPLORATION_N_ITER,
+                                                           args=[P, degrees_of_freedom, n_samples, self.n_components],
+                                                           kwargs=dict(skip_num_points=skip_num_points))
+        if self.verbose:
+            print("[t-SNE] KL divergence after %d iterations with early exaggeration: %f" % (it + 1, kl_divergence))
+
+        # Learning schedule (part 2): disable early exaggeration and finish
+        # optimization with a higher momentum at 0.8
+        P /= self.early_exaggeration
+        remaining = self.n_iter - self._EXPLORATION_N_ITER
+        if it < self._EXPLORATION_N_ITER or remaining > 0:
+            it = it + 1
+            params, kl_divergence, it = _gradient_descent(objective=obj_func,
+                                                               p0=params, 
+                                                               it=it, 
+                                                               n_iter=self.n_iter,
+                                                               args=[P, degrees_of_freedom, n_samples, self.n_components],
+                                                               kwargs=dict(skip_num_points=skip_num_points))
+
+        # Save the final number of iterations
+        self.n_iter_ = it
+
+        if self.verbose:
+            print(
+                "[t-SNE] KL divergence after %d iterations: %f"
+                % (it + 1, kl_divergence)
+            )
+
+        X_embedded = params.reshape(n_samples, self.n_components)
+        self.kl_divergence_ = kl_divergence
+
+        return X_embedded
+
+    def fit_transform(self, distributions):
+
+        embedding = self._fit(distributions)
+        self.embedding_ = embedding
+        return self.embedding_

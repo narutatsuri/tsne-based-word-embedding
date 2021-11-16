@@ -6,7 +6,7 @@ punctuation = string.punctuation.replace(allowed_punctuation, "")
 lowercase = False
 clip_word_frequency = 10
 window_size = 4
-docs_to_look_at = 1000
+docs_to_look_at = 10000
 
 vocabulary_dir = "data/document/files/vocabulary_small.pkl"
 vocabulary_sample_dir = "data/document/files/sample/vocabulary_sample.pkl"
@@ -21,5 +21,7 @@ dissimilarity_matrix_h5_dir = "data/document/files/dissimilarity_matrix_small.h5
 dissimilarity_matrix_h5_sample_dir = "data/document/files/sample/dissimilarity_matrix_sample.h5"
 
 sample_doc = "the brown fox jumped over the yellow fence."
+
 not_sample = True
 smoothing = True
+large_mode = True

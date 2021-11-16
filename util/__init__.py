@@ -14,6 +14,7 @@ normalization = False
 randomization = False
 scale_factor = 10000
 scaling = False
+train_type = "tsne_distribution"
 
 #? Parameters for initialization
 uniform_sigma = 1.0
